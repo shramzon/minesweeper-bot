@@ -1,20 +1,48 @@
 import os
 import random
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
+users = {}
 games = {}
 
+BONUS_AMOUNT = 500
+BONUS_COOLDOWN = 60
+START_BALANCE = 1000
+BET_AMOUNT = 100
+FIELD_SIZE = 5
+MINES_COUNT = 3
+
+def get_user(uid):
+    if uid not in users:
+        users[uid] = {
+            "balance": START_BALANCE,
+            "games_played": 0,
+            "games_won": 0,
+            "total_won": 0,
+            "last_bonus": 0
+        }
+    return users[uid]
+
+def calc_multiplier(opened):
+    if opened == 0:
+        return 1.00
+    return round(1.0 + opened * 0.35 + (opened * opened) * 0.08, 2)
+
 class MinesGame:
-    def __init__(self, size=5, mines=3):
-        self.size = size
-        self.mines_count = mines
-        self.board = [[False]*size for _ in range(size)]
-        self.revealed = [[False]*size for _ in range(size)]
+    def __init__(self, uid):
+        self.uid = uid
+        self.size = FIELD_SIZE
+        self.mines_count = MINES_COUNT
+        self.board = [[False]*self.size for _ in range(self.size)]
+        self.revealed = [[False]*self.size for _ in range(self.size)]
         self.game_over = False
         self.won = False
         self.opened = 0
-        self.total_safe = size*size - mines
+        self.total_safe = self.size*self.size - self.mines_count
+        self.bet = BET_AMOUNT
+        self.cashed_out = False
         self.place_mines()
     
     def place_mines(self):
@@ -28,26 +56,27 @@ class MinesGame:
     def reveal(self, r, c):
         if self.game_over or self.revealed[r][c]:
             return "already"
-        
         self.revealed[r][c] = True
         self.opened += 1
-        
         if self.board[r][c]:
             self.game_over = True
             self.won = False
             return "mine"
-        
         if self.opened == self.total_safe:
             self.game_over = True
             self.won = True
             return "win"
-        
         return "safe"
     
-    def get_multiplier(self):
-        if self.opened == 0:
-            return 1.0
-        return round(1 + (self.opened * 0.5), 2)
+    def cashout(self):
+        if self.opened == 0 or self.game_over:
+            return 0
+        mult = calc_multiplier(self.opened)
+        win = int(self.bet * mult)
+        self.game_over = True
+        self.cashed_out = True
+        self.won = True
+        return win
     
     def get_keyboard(self):
         buttons = []
@@ -55,39 +84,54 @@ class MinesGame:
             row = []
             for c in range(self.size):
                 if self.revealed[r][c]:
-                    if self.board[r][c]:
-                        text = ""
-                    else:
-                        text = ""
+                    text = "" if self.board[r][c] else ""
                 else:
                     text = "⬜"
                 row.append(InlineKeyboardButton(text, callback_data=f"{r}_{c}"))
             buttons.append(row)
         
-        buttons.append([InlineKeyboardButton(f"💰 Забрать x{self.get_multiplier()}", callback_data="cashout")])
-        buttons.append([InlineKeyboardButton("🔄 Новая игра", callback_data="new")])
-        
+        mult = calc_multiplier(self.opened)
+        cashout_btn = InlineKeyboardButton(
+            f"💰 Забрать x{mult} ({int(self.bet*mult)}₽)",
+            callback_data="cashout"
+        ) if self.opened > 0 and not self.game_over else InlineKeyboardButton(
+            f"💰 Забрать x{mult}",
+            callback_data="cashout"
+        )
+        buttons.append([cashout_btn])
+        buttons.append([InlineKeyboardButton("🔄 Новая игра (-100₽)", callback_data="new")])
         return InlineKeyboardMarkup(buttons)
     
-    def get_status(self):
+    def get_status(self, user):
         if self.game_over:
-            if self.won:
-                return f"🎉 ПОБЕДА! Открыл все {self.total_safe} клеток!\n💰 Выигрыш: x{self.get_multiplier()}"
+            if self.cashed_out:
+                win = int(self.bet * calc_multiplier(self.opened))
+                return f"💰 ЗАБРАЛ x{calc_multiplier(self.opened)}!\n+{win}₽ на баланс!\nОткрыл: {self.opened} клеток"
+            elif self.won:
+                win = int(self.bet * calc_multiplier(self.opened))
+                return f"🎉 ВСЕ КЛЕТКИ! x{calc_multiplier(self.opened)}\n+{win}₽ на баланс!"
             else:
-                return f"💥 БОМБА! Проигрыш!\nОткрыл клеток: {self.opened}"
-        return f"🎮 Открыто: {self.opened}/{self.total_safe}\n💰 Множитель: x{self.get_multiplier()}"
+                return f"💥 БОМБА! -{self.bet}₽\nОткрыл: {self.opened} клеток"
+        return f" Ставка: {self.bet}₽\n💰 Множитель: x{calc_multiplier(self.opened)}\n Открыто: {self.opened}/{self.total_safe}\n💣 Мин: {self.mines_count}\n\nБаланс: {user['balance']}₽"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    games[uid] = MinesGame(size=5, mines=3)
+    user = get_user(uid)
+    
+    if user["balance"] < BET_AMOUNT:
+        await update.message.reply_text(f"❌ Недостаточно средств!\nБаланс: {user['balance']}₽\nНужно: {BET_AMOUNT}₽\n\nВозьми бонус: /bonus")
+        return
+    
+    user["balance"] -= BET_AMOUNT
+    user["games_played"] += 1
+    games[uid] = MinesGame(uid)
+    
     await update.message.reply_text(
-        " МИНЫ! Как в казино!\n\n"
-        "⬜ - закрытая клетка\n"
-        "💎 - безопасно (открыл)\n"
-        "💣 - мина (проигрыш)\n\n"
-        "Открывай клетки, избегай мин!\n"
-        "Чем больше открыл - тем больше выигрыш!\n"
-        "Забери выигрыш в любой момент!",
+        f"🎮 МИНЫ! Ставка: {BET_AMOUNT}₽\n\n"
+        f"💎 Открывай клетки — множитель растёт!\n"
+        f"💣 Не попади на мину!\n"
+        f"💰 Забирай выигрыш в любой момент!\n\n"
+        f"Баланс: {user['balance']}₽",
         reply_markup=games[uid].get_keyboard()
     )
 
@@ -96,26 +140,41 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     uid = query.from_user.id
     data = query.data
-    
-    if uid not in games:
-        games[uid] = MinesGame()
-    game = games[uid]
+    user = get_user(uid)
     
     if data == "new":
-        games[uid] = MinesGame(size=5, mines=3)
-        await query.edit_message_text("🔄 Новая игра! Удачи!", reply_markup=games[uid].get_keyboard())
+        if user["balance"] < BET_AMOUNT:
+            await query.edit_message_text(f"❌ Недостаточно средств!\nБаланс: {user['balance']}₽\nВозьми бонус: /bonus")
+            return
+        user["balance"] -= BET_AMOUNT
+        user["games_played"] += 1
+        games[uid] = MinesGame(uid)
+        await query.edit_message_text(
+            f"🔄 Новая игра! Ставка: {BET_AMOUNT}₽\nБаланс: {user['balance']}₽",
+            reply_markup=games[uid].get_keyboard()
+        )
         return
     
     if data == "cashout":
-        if game.opened > 0 and not game.game_over:
-            await query.edit_message_text(
-                f"💰 Забрал выигрыш x{game.get_multiplier()}!\nОткрыл клеток: {game.opened}",
-                reply_markup=game.get_keyboard()
-            )
-            game.game_over = True
-            game.won = True
+        if uid not in games or games[uid].game_over:
+            await query.answer("Нет активной игры!")
+            return
+        game = games[uid]
+        if game.opened == 0:
+            await query.answer("Открой хотя бы 1 клетку!")
+            return
+        win = game.cashout()
+        user["balance"] += win
+        user["games_won"] += 1
+        user["total_won"] += win
+        await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard())
         return
     
+    if uid not in games:
+        await query.answer("Начни игру: /start")
+        return
+    
+    game = games[uid]
     if game.game_over:
         await query.answer("Игра окончена! Начни новую 🔄")
         return
@@ -124,16 +183,57 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = game.reveal(r, c)
     
     if result == "mine":
-        await query.edit_message_text(game.get_status(), reply_markup=game.get_keyboard())
+        user["balance"] -= 0
+        await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard())
     elif result == "win":
-        await query.edit_message_text(game.get_status(), reply_markup=game.get_keyboard())
+        win = int(game.bet * calc_multiplier(game.opened))
+        user["balance"] += win
+        user["games_won"] += 1
+        user["total_won"] += win
+        await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard())
     else:
-        await query.edit_message_text(game.get_status(), reply_markup=game.get_keyboard())
+        await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard())
+
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    
+    win_rate = round(user["games_won"] / user["games_played"] * 100, 1) if user["games_played"] > 0 else 0
+    
+    text = (
+        f"👤 Твой профиль:\n\n"
+        f" Баланс: {user['balance']}₽\n"
+        f"🎮 Игр сыграно: {user['games_played']}\n"
+        f" Игр выиграно: {user['games_won']}\n"
+        f" Винрейт: {win_rate}%\n"
+        f"💵 Всего выиграно: {user['total_won']}₽\n\n"
+        f"Команды:\n"
+        f"/start — начать игру\n"
+        f"/bonus — получить бонус\n"
+        f"/profile — этот профиль"
+    )
+    await update.message.reply_text(text)
+
+async def bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    now = int(time.time())
+    
+    time_left = BONUS_COOLDOWN - (now - user["last_bonus"])
+    if time_left > 0:
+        await update.message.reply_text(f" Бонус уже получен!\nПовторно через: {time_left} сек.")
+        return
+    
+    user["balance"] += BONUS_AMOUNT
+    user["last_bonus"] = now
+    await update.message.reply_text(f" Бонус +{BONUS_AMOUNT}₽!\nБаланс: {user['balance']}₽")
 
 def main():
     TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('profile', profile))
+    app.add_handler(CommandHandler('bonus', bonus))
     app.add_handler(CallbackQueryHandler(button))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
