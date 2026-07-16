@@ -1,0 +1,2 @@
+# minesweeper-bot
+мины
