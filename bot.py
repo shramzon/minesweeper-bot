@@ -3,7 +3,6 @@ import random
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# Хранилище игр
 games = {}
 
 class MinesweeperGame:
@@ -52,14 +51,12 @@ class MinesweeperGame:
         
         if self.board[r][c] == -1:
             self.game_over = True
-            # Показать все мины
             for i in range(self.size):
                 for j in range(self.size):
                     if self.board[i][j] == -1:
                         self.revealed[i][j] = True
             return
         
-        # Если 0, открыть соседние
         if self.board[r][c] == 0:
             for dr in [-1, 0, 1]:
                 for dc in [-1, 0, 1]:
@@ -68,7 +65,6 @@ class MinesweeperGame:
                         if not self.revealed[nr][nc] and not self.flagged[nr][nc]:
                             self.reveal(nr, nc)
         
-        # Проверка победы
         self.check_win()
     
     def toggle_flag(self, r, c):
@@ -91,7 +87,7 @@ class MinesweeperGame:
             for c in range(self.size):
                 if self.revealed[r][c]:
                     if self.board[r][c] == -1:
-                        text = "💣"
+                        text = ""
                     elif self.board[r][c] == 0:
                         text = "·"
                     else:
@@ -106,7 +102,7 @@ class MinesweeperGame:
         if not self.game_over:
             buttons.append([
                 InlineKeyboardButton("🔄 Новая игра", callback_data="new"),
-                InlineKeyboardButton("🏴 Поставить флаг", callback_data="mode_flag")
+                InlineKeyboardButton("🏴 Флаг", callback_data="mode_flag")
             ])
         
         return InlineKeyboardMarkup(buttons)
@@ -114,7 +110,7 @@ class MinesweeperGame:
     def get_message(self):
         if self.game_over:
             if self.won:
-                return "🎉 Поздравляю! Вы победили!"
+                return " Поздравляю! Вы победили!"
             else:
                 return "💥 Бум! Вы наступили на мину!"
         return "🎮 Играем! Нажимайте на клетки"
@@ -128,7 +124,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Нажимайте на клетки, чтобы открыть их.\n"
         "Цифры показывают количество мин рядом.\n"
         "Избегайте мин 💣!\n\n"
-        "Используйте кнопку 'Поставить флаг' чтобы отмечать мины.",
+        "Используйте кнопку 'Флаг' чтобы отмечать мины.",
         reply_markup=games[user_id].get_keyboard()
     )
 
@@ -148,7 +144,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if data == "mode_flag":
-        # Простая реализация - следующий клик поставит флаг
         context.user_data['flag_mode'] = True
         await query.answer("Режим флага активирован! Нажмите на клетку.")
         return
@@ -184,7 +179,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=game.get_keyboard()
     )
 
-def main():
+async def main():
     TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
     
     app = Application.builder().token(TOKEN).build()
@@ -192,7 +187,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    main()
+    import asyncio
+    asyncio.run(main())
