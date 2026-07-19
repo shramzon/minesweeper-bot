@@ -3,7 +3,7 @@ import random
 import time
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 
 # --- ДАННЫЕ ПОЛЬЗОВАТЕЛЕЙ ---
 users = {}
@@ -131,6 +131,11 @@ class MinesGame:
 # --- КОМАНДЫ БЕЗ "/" ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Проверяем, что это личное сообщение или группа
+    chat_type = update.effective_chat.type
+    if chat_type not in ['private', 'group', 'supergroup']:
+        return
+    
     uid = update.effective_user.id
     user = get_user(uid)
     lock = get_lock(uid)
