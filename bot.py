@@ -2,20 +2,19 @@ import os
 import random
 import time
 import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 
 # --- ДАННЫЕ ПОЛЬЗОВАТЕЛЕЙ ---
 users = {}
 games = {}
 locks = {}
 farms = {}
-pending_actions = {}
 
 BONUS_AMOUNT = 500
 BONUS_COOLDOWN = 20 * 60  # 20 минут
 START_BALANCE = 1000
-BET_AMOUNT = 100
+DEFAULT_MINES = 3
 FIELD_SIZE = 5
 
 def get_user(uid):
@@ -48,10 +47,11 @@ def calc_multiplier(opened, total_cells, mines_count):
     return round(multiplier, 2)
 
 class MinesGame:
-    def __init__(self, uid, mines_count):
+    def __init__(self, uid, mines_count, bet_amount):
         self.uid = uid
         self.size = FIELD_SIZE
         self.mines_count = mines_count
+        self.bet = bet_amount
         self.total_cells = self.size * self.size
         self.board = [[False]*self.size for _ in range(self.size)]
         self.revealed = [[False]*self.size for _ in range(self.size)]
@@ -59,9 +59,7 @@ class MinesGame:
         self.won = False
         self.opened = 0
         self.total_safe = self.total_cells - self.mines_count
-        self.bet = BET_AMOUNT
         self.cashed_out = False
-        self.start_time = time.time()
         self.place_mines()
     
     def place_mines(self):
@@ -97,18 +95,38 @@ class MinesGame:
         self.won = True
         return win
     
-    def get_field(self):
-        field = []
+    def get_keyboard(self, reveal_all=False):
+        buttons = []
         for r in range(self.size):
             row = []
             for c in range(self.size):
                 if self.revealed[r][c]:
                     text = "⚫️" if self.board[r][c] else "💎"
+                elif reveal_all and self.board[r][c]:
+                    text = "⚫️"
                 else:
                     text = "⬛"
-                row.append(text)
-            field.append(" ".join(row))
-        return "\n".join(field)
+                row.append(InlineKeyboardButton(text, callback_data=f"cell_{r}_{c}"))
+            buttons.append(row)
+        
+        mult = calc_multiplier(self.opened, self.total_cells, self.mines_count)
+        if self.opened > 0 and not self.game_over:
+            buttons.append([InlineKeyboardButton(f"💰 Забрать x{mult} ({int(self.bet*mult)} мун)", callback_data="cashout")])
+        buttons.append([InlineKeyboardButton("🔄 Новая игра", callback_data="new")])
+        return InlineKeyboardMarkup(buttons)
+    
+    def get_status(self, user):
+        mult = calc_multiplier(self.opened, self.total_cells, self.mines_count)
+        if self.game_over:
+            if self.cashed_out:
+                win = int(self.bet * mult)
+                return f"💰 ЗАБРАЛ x{mult}!\n+{win} мун на баланс!\nОткрыл: {self.opened} клеток"
+            elif self.won:
+                win = int(self.bet * mult)
+                return f"🎉 ВСЕ КЛЕТКИ! x{mult}\n+{win} мун на баланс!"
+            else:
+                return f"💥 БОМБА! -{self.bet} мун\nОткрыл: {self.opened} клеток"
+        return f"💰 Множитель: x{mult}\n💎 Открыто: {self.opened}/{self.total_safe}\n⚫️ Мин: {self.mines_count}\n💵 Баланс: {user['balance']} мун"
 
 # --- КОМАНДЫ БЕЗ "/" ---
 
@@ -141,11 +159,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🎮 Помощь по боту:\n\n"
                 "профиль — информация о вас\n"
                 "рейтинг — топ игроков\n"
-                "мины — начать игру (ставка 100 мун)\n"
-                "  • Введите количество мин (1-10)\n"
-                "  • Введите координаты (1 1, 2 3...)\n"
-                "  • забрать — забрать выигрыш\n"
-                "  • поле — показать поле\n"
+                "мины — начать игру (показать выбор ставки, 3 мины)\n"
+                "мины 5 1000 — игра с 5 минами и ставкой 1000 мун\n"
                 "магазин — купить ферму (пассивный доход)\n"
                 "собрать — собрать доход с фермы\n"
                 "бонус — получить бонус раз в 20 минут\n\n"
@@ -205,17 +220,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines))
             return
         
-        elif text in ["мины", "игра", "сыграть"]:
-            if user["balance"] < BET_AMOUNT:
-                await update.message.reply_text(f"❌ Недостаточно мун!\nБаланс: {user['balance']} мун\nНужно: {BET_AMOUNT} мун\n\nВозьми: бонус")
+        elif text.startswith("мины"):
+            parts = text.split()
+            
+            # Быстрая игра: мины 5 1000
+            if len(parts) == 3:
+                try:
+                    mines_count = int(parts[1])
+                    bet_amount = int(parts[2])
+                except ValueError:
+                    await update.message.reply_text("❌ Неверный формат! Пример: мины 5 1000")
+                    return
+                
+                if mines_count < 1 or mines_count > 24:
+                    await update.message.reply_text("❌ Введите количество мин от 1 до 24!")
+                    return
+                
+                if bet_amount < 10:
+                    await update.message.reply_text("❌ Минимальная ставка: 10 мун!")
+                    return
+                
+                if user["balance"] < bet_amount:
+                    await update.message.reply_text(f"❌ Недостаточно мун!\nБаланс: {user['balance']} мун\nНужно: {bet_amount} мун\n\nВозьми: бонус")
+                    return
+                
+                user["balance"] -= bet_amount
+                user["total_spent"] += bet_amount
+                user["games_played"] += 1
+                games[uid] = MinesGame(uid, mines_count, bet_amount)
+                
+                await update.message.reply_text(
+                    f"🎮 МИНЫ! Ставка: {bet_amount} мун | ⚫️ Мин: {mines_count}\n\n"
+                    f"Открывайте клетки!",
+                    reply_markup=games[uid].get_keyboard()
+                )
                 return
             
-            await update.message.reply_text(
-                f"🎮 МИНЫ! Ставка: {BET_AMOUNT} мун\n\nВведите количество мин (1-10):"
-            )
+            # Обычная игра: мины (показать выбор ставки)
+            elif len(parts) == 1:
+                # Показываем кнопки ставок
+                buttons = [
+                    [InlineKeyboardButton("100 мун", callback_data="bet_100"),
+                     InlineKeyboardButton("500 мун", callback_data="bet_500")],
+                    [InlineKeyboardButton("1000 мун", callback_data="bet_1000"),
+                     InlineKeyboardButton("2000 мун", callback_data="bet_2000")]
+                ]
+                
+                await update.message.reply_text(
+                    f"🎮 МИНЫ! 3 мины по умолчанию\n\nВыберите ставку:",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+                return
             
-            pending_actions[uid] = "choosing_mines"
-            return
+            else:
+                await update.message.reply_text("❌ Неверный формат! Пример: мины 5 1000 или просто 'мины'")
+                return
         
         elif text in ["магазин", "фермы", "шоп"]:
             farm_info = {
@@ -226,24 +285,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             current_farm = farms.get(uid, {}).get("type", "none")
             
-            text_reply = "🏪 Магазин ферм\n\n"
+            buttons = []
             for key, info in farm_info.items():
-                status = "✅ Куплена" if current_farm == key else f"🛒 Купить ({info['price']} мун)"
-                text_reply += f"{info['name']} — {info['income']}/час | {status}\n"
+                status = "✅ Куплена" if current_farm == key else "🛒 Купить"
+                buttons.append([InlineKeyboardButton(f"{info['name']} — {info['price']} мун | {status}", callback_data=f"buy_{key}")])
             
-            text_reply += f"\nВведите номер фермы для покупки:\n"
-            text_reply += f"1 — Малая (2000 мун)\n"
-            text_reply += f"2 — Средняя (5000 мун)\n"
-            text_reply += f"3 — Большая (10000 мун)\n\n"
-            text_reply += f"Баланс: {user['balance']} мун"
+            buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="back")])
             
-            await update.message.reply_text(text_reply)
-            pending_actions[uid] = "choosing_farm"
+            await update.message.reply_text(
+                "🏪 Магазин ферм\n\n"
+                "Фермы дают пассивный доход каждые 60 минут.\n"
+                "Собирайте вручную через команду 'собрать'.\n\n"
+                f"Баланс: {user['balance']} мун",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
             return
         
         elif text in ["собрать", "доход", "ферма"]:
             if uid not in farms:
-                await update.message.reply_text("❌ У вас нет фермы!\nКупите: магазин")
+                await update.message.reply_text("❌ У вас нет фермы!\nКупите в магазине: магазин")
                 return
             
             farm = farms[uid]
@@ -285,183 +345,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🎁 Бонус +{BONUS_AMOUNT} мун!\n💰 Баланс: {user['balance']} мун")
             return
         
-        # --- ОБРАБОТКА ИГРЫ ---
-        elif pending_actions.get(uid) == "choosing_mines":
-            try:
-                mines_count = int(text)
-                if mines_count < 1 or mines_count > 10:
-                    await update.message.reply_text("❌ Введите число от 1 до 10!")
-                    return
-                
-                if user["balance"] < BET_AMOUNT:
-                    await update.message.reply_text(f"❌ Недостаточно мун!\nБаланс: {user['balance']} мун")
-                    return
-                
-                user["balance"] -= BET_AMOUNT
-                user["total_spent"] += BET_AMOUNT
-                user["games_played"] += 1
-                games[uid] = MinesGame(uid, mines_count)
-                
-                del pending_actions[uid]
-                
-                game = games[uid]
-                await update.message.reply_text(
-                    f"🎮 МИНЫ! Ставка: {BET_AMOUNT} мун | ⚫️ Мин: {mines_count}\n\n"
-                    f"`{game.get_field()}`\n\n"
-                    f"💰 Множитель: x{calc_multiplier(game.opened, game.total_cells, game.mines_count)}\n"
-                    f"💎 Открыто: {game.opened}/{game.total_safe}\n"
-                    f"Баланс: {user['balance']} мун\n\n"
-                    f"Введите координаты (например, '1 2') или:\n"
-                    f"забрать — забрать выигрыш\n"
-                    f"поле — показать поле\n"
-                    f"новая — новая игра"
-                )
-                return
-            except ValueError:
-                await update.message.reply_text("❌ Введите число от 1 до 10!")
-                return
-        
-        elif pending_actions.get(uid) == "choosing_farm":
-            try:
-                choice = int(text)
-                if choice < 1 or choice > 3:
-                    await update.message.reply_text("❌ Введите 1, 2 или 3!")
-                    return
-                
-                farm_types = ["small", "medium", "large"]
-                farm_prices = [2000, 5000, 10000]
-                farm_names = ["Малая ферма", "Средняя ферма", "Большая ферма"]
-                
-                farm_type = farm_types[choice - 1]
-                price = farm_prices[choice - 1]
-                name = farm_names[choice - 1]
-                
-                if user["balance"] < price:
-                    await update.message.reply_text(f"❌ Недостаточно мун!\nНужно: {price}, у вас: {user['balance']}")
-                    return
-                
-                user["balance"] -= price
-                farms[uid] = {"type": farm_type, "level": 1, "last_collect": int(time.time())}
-                
-                del pending_actions[uid]
-                
-                await update.message.reply_text(f"✅ Куплена {name}!\nБаланс: {user['balance']} мун")
-            except ValueError:
-                await update.message.reply_text("❌ Введите число: 1, 2 или 3!")
-            return
-        
-        # --- КОМАНДЫ В ИГРЕ ---
-        elif text in ["забрать", "выйти", "забрать выигрыш"]:
-            if uid not in games:
-                await update.message.reply_text("❌ Нет активной игры!\nНачните: мины")
-                return
-            
-            game = games[uid]
-            if game.opened == 0:
-                await update.message.reply_text("❌ Откройте хотя бы 1 клетку!")
-                return
-            
-            if game.game_over:
-                await update.message.reply_text("❌ Игра уже окончена!")
-                return
-            
-            win = game.cashout()
-            user["balance"] += win
-            user["games_won"] += 1
-            user["total_won"] += win
-            
-            await update.message.reply_text(
-                f"💰 ЗАБРАЛ x{calc_multiplier(game.opened, game.total_cells, game.mines_count)}!\n"
-                f"+{win} мун на баланс!\n\n"
-                f"`{game.get_field()}`\n\n"
-                f"Баланс: {user['balance']} мун"
-            )
-            
-            del games[uid]
-            return
-        
-        elif text in ["поле", "показать", "карта"]:
-            if uid not in games:
-                await update.message.reply_text("❌ Нет активной игры!\nНачните: мины")
-                return
-            
-            game = games[uid]
-            await update.message.reply_text(
-                f"`{game.get_field()}`\n\n"
-                f"💰 Множитель: x{calc_multiplier(game.opened, game.total_cells, game.mines_count)}\n"
-                f"💎 Открыто: {game.opened}/{game.total_safe}\n"
-                f"⚫️ Мин: {game.mines_count}\n"
-                f"Баланс: {user['balance']} мун"
-            )
-            return
-        
-        elif text in ["новая", "новая игра", "перезапуск"]:
-            if uid in games:
-                del games[uid]
-            
-            if user["balance"] < BET_AMOUNT:
-                await update.message.reply_text(f"❌ Недостаточно мун!\nБаланс: {user['balance']} мун\nВозьми: бонус")
-                return
-            
-            await update.message.reply_text(
-                f"🎮 НОВАЯ ИГРА! Ставка: {BET_AMOUNT} мун\n\nВведите количество мин (1-10):"
-            )
-            
-            pending_actions[uid] = "choosing_mines"
-            return
-        
-        # --- КООРДИНАТЫ В ИГРЕ ---
-        elif uid in games:
-            game = games[uid]
-            if game.game_over:
-                await update.message.reply_text("❌ Игра окончена!\nНачните новую: новая")
-                return
-            
-            try:
-                coords = text.split()
-                if len(coords) != 2:
-                    await update.message.reply_text("❌ Введите 2 числа через пробел (например, '1 2')")
-                    return
-                
-                r, c = int(coords[0]) - 1, int(coords[1]) - 1  # 1-indexed -> 0-indexed
-                
-                if r < 0 or r >= game.size or c < 0 or c >= game.size:
-                    await update.message.reply_text(f"❌ Введите числа от 1 до {game.size}!")
-                    return
-                
-                result = game.reveal(r, c)
-                
-                if result == "mine":
-                    await update.message.reply_text(
-                        f"💥 БОМБА! -{BET_AMOUNT} мун\n\n"
-                        f"`{game.get_field()}`\n\n"
-                        f"Открыл: {game.opened} клеток\n"
-                        f"Баланс: {user['balance']} мун"
-                    )
-                    del games[uid]
-                elif result == "win":
-                    win = int(game.bet * calc_multiplier(game.opened, game.total_cells, game.mines_count))
-                    user["balance"] += win
-                    user["games_won"] += 1
-                    user["total_won"] += win
-                    await update.message.reply_text(
-                        f"🎉 ВСЕ КЛЕТКИ! x{calc_multiplier(game.opened, game.total_cells, game.mines_count)}\n"
-                        f"+{win} мун на баланс!\n\n"
-                        f"`{game.get_field()}`\n\n"
-                        f"Баланс: {user['balance']} мун"
-                    )
-                    del games[uid]
-                else:
-                    await update.message.reply_text(
-                        f"`{game.get_field()}`\n\n"
-                        f"💰 Множитель: x{calc_multiplier(game.opened, game.total_cells, game.mines_count)}\n"
-                        f"💎 Открыто: {game.opened}/{game.total_safe}\n"
-                        f"Баланс: {user['balance']} мун"
-                    )
-            except ValueError:
-                await update.message.reply_text("❌ Введите 2 числа через пробел (например, '1 2')")
-            return
-        
         # --- НЕИЗВЕСТНАЯ КОМАНДА ---
         else:
             await update.message.reply_text(
@@ -469,11 +352,114 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Попробуйте: помощь"
             )
 
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = query.from_user.id
+    data = query.data
+    user = get_user(uid)
+    lock = get_lock(uid)
+    
+    async with lock:
+        await query.answer()
+        
+        # Выбор ставки через кнопки
+        if data.startswith("bet_"):
+            bet_amount = int(data.split("_")[1])
+            
+            if user["balance"] < bet_amount:
+                await query.edit_message_text(f"❌ Недостаточно мун!\nБаланс: {user['balance']} мун\nНужно: {bet_amount} мун\n\nВозьми: бонус")
+                return
+            
+            user["balance"] -= bet_amount
+            user["total_spent"] += bet_amount
+            user["games_played"] += 1
+            games[uid] = MinesGame(uid, DEFAULT_MINES, bet_amount)
+            
+            await query.edit_message_text(
+                f"🎮 МИНЫ! Ставка: {bet_amount} мун | ⚫️ Мин: {DEFAULT_MINES}\n\n"
+                f"Открывайте клетки!",
+                reply_markup=games[uid].get_keyboard()
+            )
+            return
+        
+        elif data.startswith("cell_"):
+            if uid not in games:
+                return
+            
+            game = games[uid]
+            if game.game_over:
+                return
+            
+            r, c = map(int, data.split("_")[1:])
+            result = game.reveal(r, c)
+            
+            if result == "mine":
+                await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard(reveal_all=True))
+            elif result == "win":
+                win = int(game.bet * calc_multiplier(game.opened, game.total_cells, game.mines_count))
+                user["balance"] += win
+                user["games_won"] += 1
+                user["total_won"] += win
+                await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard(reveal_all=True))
+            else:
+                await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard())
+            return
+        
+        elif data == "cashout":
+            if uid not in games or games[uid].game_over:
+                return
+            game = games[uid]
+            if game.opened == 0:
+                return
+            win = game.cashout()
+            user["balance"] += win
+            user["games_won"] += 1
+            user["total_won"] += win
+            await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard(reveal_all=True))
+            return
+        
+        elif data == "new":
+            buttons = [
+                [InlineKeyboardButton("100 мун", callback_data="bet_100"),
+                 InlineKeyboardButton("500 мун", callback_data="bet_500")],
+                [InlineKeyboardButton("1000 мун", callback_data="bet_1000"),
+                 InlineKeyboardButton("2000 мун", callback_data="bet_2000")]
+            ]
+            
+            await query.edit_message_text(
+                f"🎮 МИНЫ! 3 мины по умолчанию\n\nВыберите ставку:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            return
+        
+        elif data.startswith("buy_"):
+            farm_type = data.split("_")[1]
+            farm_info = {
+                "small": {"price": 2000, "name": "Малая ферма"},
+                "medium": {"price": 5000, "name": "Средняя ферма"},
+                "large": {"price": 10000, "name": "Большая ферма"}
+            }
+            
+            price = farm_info[farm_type]["price"]
+            if user["balance"] < price:
+                await query.answer(f"Недостаточно мун! Нужно {price}")
+                return
+            
+            user["balance"] -= price
+            farms[uid] = {"type": farm_type, "level": 1, "last_collect": int(time.time())}
+            await query.answer(f"✅ Куплена {farm_info[farm_type]['name']}!")
+            return
+        
+        elif data == "back":
+            await query.edit_message_text("Возврат в меню...")
+            return
+
 def main():
     TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
     app = Application.builder().token(TOKEN).build()
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button))
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
