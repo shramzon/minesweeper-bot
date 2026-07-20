@@ -2,8 +2,14 @@ import os
 import random
 import time
 import asyncio
+import pickle
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+
+# --- ФАЙЛЫ ДЛЯ СОХРАНЕНИЯ ---
+GAMES_FILE = "games.pkl"
+USERS_FILE = "users.pkl"
+FARMS_FILE = "farms.pkl"
 
 # --- ДАННЫЕ ПОЛЬЗОВАТЕЛЕЙ ---
 users = {}
@@ -16,6 +22,35 @@ BONUS_COOLDOWN = 20 * 60  # 20 минут
 START_BALANCE = 1000
 DEFAULT_MINES = 3
 FIELD_SIZE = 5
+
+def load_data():
+    global users, games, farms
+    try:
+        if os.path.exists(GAMES_FILE):
+            with open(GAMES_FILE, "rb") as f:
+                loaded_games = pickle.load(f)
+                games.update(loaded_games)
+        if os.path.exists(USERS_FILE):
+            with open(USERS_FILE, "rb") as f:
+                loaded_users = pickle.load(f)
+                users.update(loaded_users)
+        if os.path.exists(FARMS_FILE):
+            with open(FARMS_FILE, "rb") as f:
+                loaded_farms = pickle.load(f)
+                farms.update(loaded_farms)
+    except Exception as e:
+        print("⚠️ Ошибка загрузки данных:", e)
+
+def save_data():
+    try:
+        with open(GAMES_FILE, "wb") as f:
+            pickle.dump(games, f)
+        with open(USERS_FILE, "wb") as f:
+            pickle.dump(users, f)
+        with open(FARMS_FILE, "wb") as f:
+            pickle.dump(farms, f)
+    except Exception as e:
+        print("⚠️ Ошибка сохранения данных:", e)
 
 def get_user(uid):
     if uid not in users:
@@ -228,6 +263,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user["total_spent"] += bet_amount
                 user["games_played"] += 1
                 games[uid] = MinesGame(uid, mines_count, bet_amount)
+                save_data()  # Сохраняем после создания игры
                 
                 await update.message.reply_text(
                     f"🎮 Ставка: {bet_amount} мун | ⚫️ Мин: {mines_count}",
@@ -301,6 +337,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user["balance"] += earnings
             user["total_collected"] += earnings
             farm["last_collect"] = now
+            save_data()  # Сохраняем после сбора
             
             await update.message.reply_text(f"💰 +{earnings} мун")
             return
@@ -317,6 +354,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             user["balance"] += BONUS_AMOUNT
             user["last_bonus"] = now
+            save_data()  # Сохраняем после бонуса
+            
             await update.message.reply_text(f"🎁 +{BONUS_AMOUNT} мун")
             return
         
@@ -345,6 +384,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user["total_spent"] += bet_amount
             user["games_played"] += 1
             games[uid] = MinesGame(uid, DEFAULT_MINES, bet_amount)
+            save_data()  # Сохраняем после начала игры
             
             await query.edit_message_text(
                 f"🎮 Ставка: {bet_amount} мун | ⚫️ Мин: {DEFAULT_MINES}",
@@ -373,6 +413,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard(reveal_all=True))
             else:
                 await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard())
+            
+            save_data()  # Сохраняем после каждого хода
             return
         
         elif data == "cashout":
@@ -386,6 +428,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user["games_won"] += 1
             user["total_won"] += win
             await query.edit_message_text(game.get_status(user), reply_markup=game.get_keyboard(reveal_all=True))
+            save_data()  # Сохраняем после кэшаута
             return
         
         elif data == "new":
@@ -416,6 +459,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             user["balance"] -= price
             farms[uid] = {"type": farm_type, "level": 1, "last_collect": int(time.time())}
+            save_data()  # Сохраняем после покупки
             await query.answer("✅ Куплена!")
             return
         
@@ -424,11 +468,18 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 def main():
+    # Загружаем данные при старте
+    load_data()
+    
     TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
     app = Application.builder().token(TOKEN).build()
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button))
+    
+    # Сохраняем перед остановкой (если возможно)
+    import atexit
+    atexit.register(save_data)
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
